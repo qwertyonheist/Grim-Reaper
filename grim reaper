@@ -1,0 +1,536 @@
+import sys, os, re
+import logging
+import pandas as pd
+import pdfplumber
+from collections import deque
+from docx import Document
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QListWidget, QListWidgetItem,
+    QLabel, QFileDialog, QMessageBox, QTextEdit, QProgressBar
+)
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QIcon
+
+# ===== LOGGING SETUP =====
+log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grimreaper.log")
+logging.basicConfig(
+    filename=log_path,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+# ===== OPTIONAL OCR =====
+OCR_ENABLED = True
+try:
+    from pdf2image import convert_from_path
+    import pytesseract
+    from PIL import Image, ImageFilter, ImageEnhance
+except Exception as e:
+    OCR_ENABLED = False
+    logging.warning(f"OCR disabled: {e}")
+
+APP_NAME = "Grim Reaper"
+APP_VERSION = "3.0"
+
+SUPPORTED_EXT = (
+    ".xlsx", ".xls", ".csv",
+    ".docx", ".doc",
+    ".pdf", ".txt"
+)
+
+FILE_FILTER = (
+    "Supported Files (*.xlsx *.xls *.csv *.docx *.doc *.pdf *.txt);;"
+    "Excel (*.xlsx *.xls);;"
+    "CSV (*.csv);;"
+    "Word (*.docx *.doc);;"
+    "PDF (*.pdf);;"
+    "Text (*.txt)"
+)
+
+LOG_MAX_LINES = 200
+
+# ================= VALID NEPAL PREFIXES =================
+# Source: NTA assigned number ranges (verified 2025)
+VALID_PREFIXES = {
+    # NTC GSM (Namaste)
+    "984", "985", "986", "976", "974", "975",
+    # Ncell
+    "980", "981", "982", "970", "971",
+    # Smart Cell
+    "961", "962", "988",
+    # UTL CDMA
+    "972",
+    # Hello Mobile
+    "963",
+}
+
+# ================= BUNDLED PATH HELPER =================
+def get_base_dir():
+    if getattr(sys, 'frozen', False):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+# ================= FILE COLLECTION =================
+def collect_files(path):
+    files = []
+    if os.path.isfile(path) and path.lower().endswith(SUPPORTED_EXT):
+        files.append(path)
+    elif os.path.isdir(path):
+        for root, _, fs in os.walk(path):
+            for f in fs:
+                full = os.path.join(root, f)
+                if full.lower().endswith(SUPPORTED_EXT):
+                    files.append(full)
+    return files
+
+def folder_preview_label(folder, files):
+    return f"📁 {os.path.basename(folder)} ({len(files)} files)"
+
+# ================= DIGIT NORMALIZATION =================
+PREETI_ASCII_MAP = {
+    ')': '०', '!': '१', '@': '२', '#': '३', '$': '४',
+    '%': '५', '^': '६', '&': '७', '*': '८', '(': '९'
+}
+UNICODE_DIGIT_MAP = str.maketrans("०१२३४५६७८९", "0123456789")
+
+def normalize_text(text):
+    text = str(text)
+    for k, v in PREETI_ASCII_MAP.items():
+        text = text.replace(k, v)
+    return text.translate(UNICODE_DIGIT_MAP)
+
+def extract_numbers(text):
+    """
+    Extract valid Nepali mobile numbers only.
+    Validates against all known NTA-assigned prefixes for
+    NTC, Ncell, Smart Cell, UTL and Hello Mobile.
+    Handles optional 977 country code prefix.
+    """
+    text = normalize_text(text)
+    cleaned = re.sub(r"[^\d]", "", text)
+    candidates = re.findall(r"(?:977)?(9\d{9})", cleaned)
+    valid = []
+    for num in candidates:
+        if len(num) == 10 and num[:3] in VALID_PREFIXES:
+            valid.append(num)
+    return valid
+
+# ================= IMAGE PREPROCESSING =================
+def preprocess_image(img):
+    img = img.convert("L")
+    w, h = img.size
+    if w < 2000 or h < 2000:
+        scale = max(2000 / w, 2000 / h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    img = ImageEnhance.Contrast(img).enhance(3.0)
+    img = img.filter(ImageFilter.SHARPEN)
+    img = img.filter(ImageFilter.SHARPEN)
+    return img
+
+# ================= COLUMN SPLITTING =================
+def split_into_columns(img, num_columns):
+    w, h = img.size
+    col_width = w // num_columns
+    columns = []
+    for i in range(num_columns):
+        left  = i * col_width
+        right = (i + 1) * col_width if i < num_columns - 1 else w
+        columns.append(img.crop((left, 0, right, h)))
+    return columns
+
+# ================= OCR WITH CONFIDENCE FILTERING =================
+def ocr_image(img):
+    """
+    Uses image_to_data to get per-word confidence scores.
+    Only accepts words with confidence >= 60 to filter ghost numbers.
+    Runs later passes (PSM 6, 11, column split) only if PSM 4 finds nothing,
+    avoiding unnecessary OCR passes that multiply ghost number chances.
+    """
+    def ocr_with_confidence(image, config):
+        try:
+            data = pytesseract.image_to_data(
+                image, lang="eng+nep", config=config,
+                output_type=pytesseract.Output.DICT
+            )
+            found = set()
+            for i, word in enumerate(data['text']):
+                conf = int(data['conf'][i])
+                if conf >= 60 and word.strip():
+                    found.update(extract_numbers(word))
+            return found
+        except Exception as e:
+            logging.warning(f"OCR confidence pass failed ({config}): {e}")
+            return set()
+
+    # Pass 1: PSM 4 — single column, best for vertical number lists
+    results = ocr_with_confidence(img, r'--oem 3 --psm 4')
+
+    # Pass 2: PSM 6 — only if PSM 4 found nothing
+    if not results:
+        results = ocr_with_confidence(img, r'--oem 3 --psm 6')
+
+    # Pass 3: PSM 11 — sparse text, only if still nothing
+    if not results:
+        results = ocr_with_confidence(img, r'--oem 3 --psm 11')
+
+    # Pass 4: column split — only if all full-image passes failed
+    if not results:
+        try:
+            for col_img in split_into_columns(img, 2):
+                results.update(
+                    ocr_with_confidence(col_img, r'--oem 3 --psm 4')
+                )
+        except Exception as e:
+            logging.warning(f"Column split OCR failed: {e}")
+
+    return list(results)
+
+# ================= OCR FOR PDF =================
+def extract_numbers_from_scanned_pdf(pdf_path, progress_cb=None):
+    out = []
+    if not OCR_ENABLED:
+        return out
+
+    base_dir = get_base_dir()
+    poppler_path   = os.path.join(base_dir, "poppler", "Library", "bin")
+    tesseract_path = os.path.join(base_dir, "tesseract", "tesseract.exe")
+    tessdata_path  = os.path.join(base_dir, "tesseract")
+
+    if not os.path.exists(poppler_path):
+        poppler_path = None
+
+    if os.path.exists(tesseract_path):
+        pytesseract.pytesseract.tesseract_cmd = tesseract_path
+        os.environ["TESSDATA_PREFIX"] = tessdata_path
+
+    try:
+        images = convert_from_path(pdf_path, dpi=300, poppler_path=poppler_path)
+        total  = len(images)
+        for idx, img in enumerate(images):
+            out.extend(ocr_image(preprocess_image(img)))
+            if progress_cb:
+                progress_cb(idx + 1, total)
+        logging.info(f"OCR done: {pdf_path} → {len(out)} found")
+    except Exception as e:
+        logging.error(f"OCR ERROR on {pdf_path}: {e}")
+
+    return out
+
+# ================= WORKER THREAD =================
+class ExtractWorker(QThread):
+    log      = Signal(str)
+    progress = Signal(int)
+    done     = Signal(list, int, int)
+
+    def __init__(self, files_snapshot):
+        super().__init__()
+        self.files = files_snapshot
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        unique = set()
+        dupes  = 0
+        total  = 0
+        total_files = len(self.files)
+
+        for idx, path in enumerate(self.files):
+            if self._cancelled:
+                self.log.emit("⚠️ Cancelled by user.")
+                break
+            try:
+                found = self.process_file(path)
+                found = list(dict.fromkeys(found))
+                for num in found:
+                    total += 1
+                    if num in unique:
+                        dupes += 1
+                    else:
+                        unique.add(num)
+                self.log.emit(f"✅ {os.path.basename(path)} → {len(found)} extracted")
+                logging.info(f"{path} → {len(found)} extracted")
+            except Exception as e:
+                self.log.emit(f"❌ ERROR: {os.path.basename(path)} → {e}")
+                logging.error(f"{path} → {e}")
+
+            self.progress.emit(int((idx + 1) / total_files * 100))
+
+        self.done.emit(sorted(unique), dupes, total)
+
+    def process_file(self, path):
+        out = []
+
+        # ===== EXCEL =====
+        if path.endswith((".xlsx", ".xls")):
+            engine = "openpyxl" if path.endswith(".xlsx") else "xlrd"
+            try:
+                import openpyxl
+                wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+                for ws in wb.worksheets:
+                    for row in ws.iter_rows(values_only=True):
+                        for cell in row:
+                            if cell is not None:
+                                out.extend(extract_numbers(str(cell)))
+                wb.close()
+            except Exception:
+                all_sheets = pd.read_excel(path, sheet_name=None, dtype=str, engine=engine)
+                for _, df in all_sheets.items():
+                    if df is None or df.empty:
+                        continue
+                    df = df.fillna("")
+                    for col in df.columns:
+                        for cell in df[col]:
+                            out.extend(extract_numbers(cell))
+
+        # ===== CSV =====
+        elif path.endswith(".csv"):
+            for chunk in pd.read_csv(path, chunksize=2000, dtype=str):
+                for col in chunk.columns:
+                    for cell in chunk[col]:
+                        out.extend(extract_numbers(str(cell)))
+
+        # ===== DOCX =====
+        elif path.endswith(".docx"):
+            doc = Document(path)
+            for t in doc.tables:
+                for r in t.rows:
+                    for c in r.cells:
+                        out.extend(extract_numbers(c.text))
+            for p in doc.paragraphs:
+                out.extend(extract_numbers(p.text))
+
+        # ===== DOC =====
+        elif path.endswith(".doc"):
+            try:
+                import docx2txt
+                text = docx2txt.process(path)
+                for line in text.splitlines():
+                    out.extend(extract_numbers(line))
+            except Exception:
+                with open(path, "rb") as f:
+                    content = f.read()
+                text = content.decode("utf-8", errors="ignore")
+                for line in text.splitlines():
+                    out.extend(extract_numbers(line))
+
+        # ===== PDF =====
+        elif path.endswith(".pdf"):
+            pdfplumber_numbers = []
+            total_text_found   = False
+
+            with pdfplumber.open(path) as pdf:
+                for page in pdf.pages:
+                    page_nums = []
+                    tables = page.extract_tables()
+                    if tables:
+                        total_text_found = True
+                        for table in tables:
+                            for row in table:
+                                row_text = " ".join(cell or "" for cell in row)
+                                page_nums.extend(extract_numbers(row_text))
+                    else:
+                        text = page.extract_text()
+                        if text and text.strip():
+                            total_text_found = True
+                            page_nums.extend(extract_numbers(text))
+                    pdfplumber_numbers.extend(page_nums)
+
+            out.extend(pdfplumber_numbers)
+
+            # Only OCR if pdfplumber found NO text = truly scanned PDF
+            if not total_text_found:
+                filename = os.path.basename(path)
+                self.log.emit(f"   🔍 Running OCR on {filename}...")
+
+                def ocr_progress(current, total_pages):
+                    self.log.emit(f"   📄 OCR page {current}/{total_pages} — {filename}")
+
+                out.extend(extract_numbers_from_scanned_pdf(path, progress_cb=ocr_progress))
+
+        # ===== TXT =====
+        elif path.endswith(".txt"):
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    out.extend(extract_numbers(line))
+
+        return out
+
+# ================= MAIN UI =================
+class GrimReaper(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
+        self.setWindowIcon(QIcon("app.ico"))
+        self.setFixedSize(520, 460)
+        self.setAcceptDrops(True)
+
+        self._known_paths = set()
+        self.worker = None
+        self._log_lines = deque(maxlen=LOG_MAX_LINES)
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel("💀 Grim Reaper")
+        title.setStyleSheet("font-size:30px;font-weight:600;")
+        layout.addWidget(title)
+
+        self.file_list = QListWidget()
+        self.file_list.setMaximumHeight(120)
+        layout.addWidget(self.file_list)
+
+        btns = QHBoxLayout()
+        self.add_btn    = QPushButton("Add")
+        self.remove_btn = QPushButton("Remove")
+        self.start_btn  = QPushButton("Start")
+        self.cancel_btn = QPushButton("Cancel")
+        self.clear_btn  = QPushButton("Clear")
+
+        self.cancel_btn.setEnabled(False)
+
+        self.add_btn.clicked.connect(self.add_files)
+        self.remove_btn.clicked.connect(self.remove_selected)
+        self.start_btn.clicked.connect(self.start)
+        self.cancel_btn.clicked.connect(self.cancel)
+        self.clear_btn.clicked.connect(self.clear_all)
+
+        for b in (self.add_btn, self.remove_btn, self.start_btn,
+                  self.cancel_btn, self.clear_btn):
+            btns.addWidget(b)
+
+        layout.addLayout(btns)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setMaximumHeight(150)
+        layout.addWidget(self.log_box)
+
+        self.stats = QLabel("Ready - Supported Files (.xlsx .xls .csv .docx .doc .pdf .txt)")
+        layout.addWidget(self.stats)
+
+    def _append_log(self, msg):
+        self._log_lines.append(msg)
+        self.log_box.setPlainText("\n".join(self._log_lines))
+        self.log_box.verticalScrollBar().setValue(
+            self.log_box.verticalScrollBar().maximum()
+        )
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            self._add_path(url.toLocalFile())
+
+    def _add_path(self, path):
+        if os.path.isdir(path):
+            files = collect_files(path)
+            new_files = [f for f in files if f not in self._known_paths]
+            if not new_files:
+                return
+            for f in new_files:
+                self._known_paths.add(f)
+            item = QListWidgetItem(folder_preview_label(path, new_files))
+            item.setData(Qt.UserRole, new_files)
+            self.file_list.addItem(item)
+        else:
+            for f in collect_files(path):
+                if f in self._known_paths:
+                    continue
+                self._known_paths.add(f)
+                item = QListWidgetItem(os.path.basename(f))
+                item.setToolTip(f)
+                item.setData(Qt.UserRole, [f])
+                self.file_list.addItem(item)
+
+    def add_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select files", "", FILE_FILTER)
+        for p in paths:
+            self._add_path(p)
+
+    def remove_selected(self):
+        for item in self.file_list.selectedItems():
+            data = item.data(Qt.UserRole)
+            if isinstance(data, list):
+                for f in data:
+                    self._known_paths.discard(f)
+            self.file_list.takeItem(self.file_list.row(item))
+
+    def clear_all(self):
+        self.file_list.clear()
+        self.log_box.clear()
+        self._log_lines.clear()
+        self.stats.setText("Ready - Supported Files (.xlsx .xls .csv .docx .doc .pdf .txt)")
+        self._known_paths.clear()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+
+    def cancel(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.cancel()
+            self.cancel_btn.setEnabled(False)
+
+    def start(self):
+        files = []
+        for i in range(self.file_list.count()):
+            data = self.file_list.item(i).data(Qt.UserRole)
+            files.extend(data)
+
+        if not files:
+            QMessageBox.warning(self, "No files", "Add files first.")
+            return
+
+        self.start_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.log_box.clear()
+        self._log_lines.clear()
+        self.stats.setText("Processing...")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+
+        self.worker = ExtractWorker(list(files))
+        self.worker.log.connect(self._append_log)
+        self.worker.progress.connect(self.progress_bar.setValue)
+        self.worker.done.connect(self.finish)
+        self.worker.start()
+
+    def finish(self, nums, dupes, total):
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.progress_bar.setValue(100)
+
+        if self.worker and self.worker._cancelled:
+            self.stats.setText("Cancelled.")
+            return
+
+        if not nums:
+            self.stats.setText("No numbers found.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Excel", "Extracted Numbers.xlsx", "Excel (*.xlsx)"
+        )
+
+        if path:
+            pd.DataFrame(nums, columns=["Phone Number"]).to_excel(path, index=False)
+            logging.info(f"Saved {len(nums)} numbers to {path}")
+
+        self.stats.setText(
+            f"Total extracted: {total} | Unique: {len(nums)} | Duplicates removed: {dupes}"
+        )
+
+# ================= RUN =================
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon("app.ico"))
+    win = GrimReaper()
+    win.show()
+    sys.exit(app.exec())
