@@ -17,7 +17,10 @@ A desktop GUI tool for bulk-extracting valid Nepali mobile numbers from Excel, C
 - **Global deduplication** — reports unique count vs. total extracted across all files
 - **Drag-and-drop + folder scan** — drop a folder to recursively collect all supported files
 
----
+## Found bugs
+
+- extracting from .pdf can sometime give wrong numbers -- idk why it brings up wrong number sometimes prolly some issue in setting dpi and tesseract. 
+
 
 ## Supported Operators
 
