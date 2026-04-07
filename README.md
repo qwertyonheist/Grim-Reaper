@@ -19,7 +19,7 @@ A desktop GUI tool for bulk-extracting valid Nepali mobile numbers from Excel, C
 
 ## Known bugs
 
-- extracting from .pdf can sometime give wrong numbers -- idk why it brings up wrong number sometimes prolly some issue in setting dpi and tesseract.
+- extracting from .pdf can sometime give wrong numbers -- idk why it brings up wrong number sometimes, prolly some issue in setting dpi and tesseract.
 
 
 ## Supported Operators
